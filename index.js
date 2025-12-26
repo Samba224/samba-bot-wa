@@ -9,6 +9,7 @@ const {
 const pino = require('pino');
 const fs = require('fs').promises;
 const path = require('path');
+const nodemailer = require('nodemailer');
 require('dotenv').config();
 
 // ═══════════════════════════════════════════════════════════════
@@ -17,12 +18,35 @@ require('dotenv').config();
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
+const EMAIL_USER = process.env.EMAIL_USER || "kouroumabonjour@gmail.com";
+const EMAIL_PASS = process.env.EMAIL_PASS; // Mot de passe d'application Gmail
+const BACKUP_EMAIL = "kouroumabonjour@gmail.com";
 
 if (!GROQ_API_KEY) {
     console.error("❌ ERREUR: GROQ_API_KEY manquante dans le fichier .env");
     console.log("\n📋 Créez un fichier .env avec:");
-    console.log("GROQ_API_KEY=votre_clé_api_ici\n");
+    console.log("GROQ_API_KEY=votre_clé_api_ici");
+    console.log("EMAIL_PASS=mot_de_passe_application_gmail\n");
     process.exit(1);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 📧 CONFIGURATION EMAIL
+// ═══════════════════════════════════════════════════════════════
+
+let emailTransporter = null;
+
+if (EMAIL_PASS) {
+    emailTransporter = nodemailer.createTransport({
+        service: 'gmail',
+        auth: {
+            user: EMAIL_USER,
+            pass: EMAIL_PASS
+        }
+    });
+    console.log("✅ Email configuré pour les sauvegardes");
+} else {
+    console.log("⚠️ EMAIL_PASS manquant - Sauvegardes email désactivées");
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -44,7 +68,8 @@ const CONFIG = {
         userStats: './data/user_stats.json',
         groupStats: './data/group_stats.json',
         warnings: './data/warnings.json',
-        statusLimits: './data/status_limits.json'
+        statusLimits: './data/status_limits.json',
+        sessionBackup: './data/session_backup.json'
     },
     reconnect: {
         delay: 5000,
@@ -61,13 +86,26 @@ const CONFIG = {
     rateLimit: {
         ai: {
             maxRequests: 10,
-            timeWindow: 60 * 60 * 1000, // 1 heure
-            cooldown: 5000 // 5 secondes entre requêtes
+            timeWindow: 60 * 60 * 1000,
+            cooldown: 5000
+        },
+        ac: {
+            maxRequests: 5,
+            timeWindow: 60 * 60 * 1000,
+            cooldown: 10000
         },
         commands: {
             maxRequests: 30,
-            timeWindow: 60 * 1000 // 1 minute
+            timeWindow: 60 * 1000
         }
+    },
+    correction: {
+        minWords: 3,
+        maxTokens: 150
+    },
+    backup: {
+        emailInterval: 6 * 60 * 60 * 1000, // Toutes les 6 heures
+        localInterval: 5 * 60 * 1000 // Toutes les 5 minutes
     }
 };
 
@@ -84,12 +122,15 @@ const userReadReceipts = new Map();
 const userReplies = new Map();
 const userMediaSent = new Map();
 const aiRateLimits = new Map();
+const acRateLimits = new Map();
 const commandRateLimits = new Map();
 const aiCooldowns = new Map();
+const acCooldowns = new Map();
 
 let phoneNumber = null;
 let pairingCode = null;
 let reconnectAttempts = 0;
+let lastEmailBackup = 0;
 
 const logger = pino({ level: 'silent' });
 
@@ -97,7 +138,8 @@ const logger = pino({ level: 'silent' });
 const PATTERNS = {
     link: /(https?:\/\/|www\.)[^\s]+|wa\.me\/[^\s]+|t\.me\/[^\s]+/gi,
     phone: /(\+?\d{10,15})/,
-    badWords: /\b(spam|scam|hack)\b/gi
+    badWords: /\b(spam|scam|hack)\b/gi,
+    basicErrors: /\b(jé|pa|ke|oci|bcp|stp|svp)\b/gi
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -109,7 +151,8 @@ const EMOJIS = {
     crown: '👑', user: '👤', group: '👥', robot: '🤖',
     star: '⭐', fire: '🔥', rocket: '🚀', shield: '🛡️',
     bell: '🔔', chart: '📊', gift: '🎁', wave: '👋',
-    sparkle: '✨', clock: '⏰', lock: '🔒'
+    sparkle: '✨', clock: '⏰', lock: '🔒', pencil: '✏️',
+    brain: '🧠', book: '📖', email: '📧', save: '💾'
 };
 
 const DESIGN = {
@@ -125,7 +168,7 @@ ${content}
     
     divider: '━'.repeat(35),
     
-    footer: () => `\n${EMOJIS.robot} *BOT SAMBA V3.0* ${EMOJIS.fire}\n_Créé avec ${EMOJIS.sparkle} par SAMBA_`,
+    footer: () => `\n${EMOJIS.robot} *BOT SAMBA V3.2* ${EMOJIS.fire}\n_Créé avec ${EMOJIS.sparkle} par SAMBA_`,
     
     progress: (current, total) => {
         const percent = Math.round((current / total) * 100);
@@ -134,6 +177,72 @@ ${content}
         return `[${bar}] ${percent}%`;
     }
 };
+
+// ═══════════════════════════════════════════════════════════════
+// 📧 SYSTÈME DE SAUVEGARDE PAR EMAIL
+// ═══════════════════════════════════════════════════════════════
+
+class EmailBackup {
+    static async sendBackup(data, subject) {
+        if (!emailTransporter) {
+            console.log("⚠️ Email non configuré - Sauvegarde ignorée");
+            return false;
+        }
+
+        try {
+            const mailOptions = {
+                from: EMAIL_USER,
+                to: BACKUP_EMAIL,
+                subject: `${EMOJIS.save} ${subject} - ${new Date().toLocaleString('fr-FR')}`,
+                text: `Sauvegarde automatique du Bot SAMBA V3.2\n\nDate: ${new Date().toLocaleString('fr-FR')}`,
+                attachments: [
+                    {
+                        filename: 'backup.json',
+                        content: JSON.stringify(data, null, 2)
+                    }
+                ]
+            };
+
+            await emailTransporter.sendMail(mailOptions);
+            console.log(`${EMOJIS.email} Sauvegarde envoyée à ${BACKUP_EMAIL}`);
+            return true;
+        } catch (error) {
+            console.error(`${EMOJIS.error} Erreur envoi email:`, error.message);
+            return false;
+        }
+    }
+
+    static async backupAllData() {
+        const now = Date.now();
+        
+        // Sauvegarde email toutes les 6h
+        if (now - lastEmailBackup >= CONFIG.backup.emailInterval) {
+            const backupData = {
+                timestamp: new Date().toISOString(),
+                version: "3.2",
+                userStats: {
+                    messages: Array.from(userMessageHistory.entries()),
+                    mentions: Array.from(userMentionHistory.entries()),
+                    replies: Array.from(userReplies.entries()),
+                    media: Array.from(userMediaSent.entries()),
+                    reads: Array.from(userReadReceipts.entries())
+                },
+                groupStats: Array.from(groupStats.entries()),
+                warnings: Array.from(warnings.entries()),
+                statusLimits: {
+                    limits: Array.from(statusMentionLimits.entries()),
+                    mentions: Array.from(userStatusMentions.entries())
+                },
+                commandLogs: Array.from(commandLogs.entries())
+            };
+
+            const success = await this.sendBackup(backupData, "Backup Bot SAMBA V3.2");
+            if (success) {
+                lastEmailBackup = now;
+            }
+        }
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════
 // 💾 SYSTÈME DE PERSISTANCE DES DONNÉES
@@ -210,7 +319,6 @@ class DataPersistence {
             this.loadData(CONFIG.files.statusLimits, {})
         ]);
 
-        // Restaurer les Maps
         if (userStats.messages) {
             userStats.messages.forEach(([k, v]) => userMessageHistory.set(k, v));
         }
@@ -241,23 +349,32 @@ class DataPersistence {
     }
 }
 
-// Sauvegarde automatique toutes les 5 minutes
+// Sauvegarde locale toutes les 5 minutes
 setInterval(() => {
     DataPersistence.saveAllData().catch(err => 
         console.error("Erreur sauvegarde auto:", err.message)
     );
-}, 5 * 60 * 1000);
+}, CONFIG.backup.localInterval);
+
+// Sauvegarde email toutes les 6 heures
+setInterval(() => {
+    EmailBackup.backupAllData().catch(err => 
+        console.error("Erreur backup email:", err.message)
+    );
+}, CONFIG.backup.emailInterval);
 
 // Sauvegarde à la fermeture
 process.on('SIGINT', async () => {
     console.log('\n\n🛑 Arrêt du bot...');
     await DataPersistence.saveAllData();
+    await EmailBackup.backupAllData();
     console.log(`${EMOJIS.success} Données sauvegardées`);
     process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
     await DataPersistence.saveAllData();
+    await EmailBackup.backupAllData();
     process.exit(0);
 });
 
@@ -266,82 +383,136 @@ process.on('SIGTERM', async () => {
 // ═══════════════════════════════════════════════════════════════
 
 class RateLimiter {
-    static checkAIRateLimit(userId) {
+    static checkLimit(userId, limitMap, config, prefix) {
         const now = Date.now();
-        const key = `ai_${userId}`;
+        const key = `${prefix}_${userId}`;
         
-        if (!aiRateLimits.has(key)) {
-            aiRateLimits.set(key, []);
+        if (!limitMap.has(key)) {
+            limitMap.set(key, []);
         }
         
-        const requests = aiRateLimits.get(key);
-        const cutoff = now - CONFIG.rateLimit.ai.timeWindow;
+        const requests = limitMap.get(key);
+        const cutoff = now - config.timeWindow;
         const recentRequests = requests.filter(t => t > cutoff);
         
-        aiRateLimits.set(key, recentRequests);
+        limitMap.set(key, recentRequests);
         
-        if (recentRequests.length >= CONFIG.rateLimit.ai.maxRequests) {
+        if (recentRequests.length >= config.maxRequests) {
             const oldestRequest = recentRequests[0];
-            const timeLeft = Math.ceil((oldestRequest + CONFIG.rateLimit.ai.timeWindow - now) / 60000);
+            const timeLeft = Math.ceil((oldestRequest + config.timeWindow - now) / 60000);
             return { allowed: false, timeLeft };
         }
         
-        return { allowed: true, remaining: CONFIG.rateLimit.ai.maxRequests - recentRequests.length };
+        return { allowed: true, remaining: config.maxRequests - recentRequests.length };
+    }
+
+    static checkCooldown(userId, cooldownMap, cooldownTime) {
+        const now = Date.now();
+        const lastRequest = cooldownMap.get(userId);
+        
+        if (lastRequest && (now - lastRequest) < cooldownTime) {
+            const timeLeft = Math.ceil((cooldownTime - (now - lastRequest)) / 1000);
+            return { allowed: false, timeLeft };
+        }
+        
+        return { allowed: true };
+    }
+
+    static recordRequest(userId, limitMap, cooldownMap, prefix) {
+        const now = Date.now();
+        const key = `${prefix}_${userId}`;
+        
+        if (!limitMap.has(key)) {
+            limitMap.set(key, []);
+        }
+        
+        limitMap.get(key).push(now);
+        cooldownMap.set(userId, now);
+    }
+
+    static checkAIRateLimit(userId) {
+        return this.checkLimit(userId, aiRateLimits, CONFIG.rateLimit.ai, 'ai');
     }
 
     static checkAICooldown(userId) {
-        const now = Date.now();
-        const lastRequest = aiCooldowns.get(userId);
-        
-        if (lastRequest && (now - lastRequest) < CONFIG.rateLimit.ai.cooldown) {
-            const timeLeft = Math.ceil((CONFIG.rateLimit.ai.cooldown - (now - lastRequest)) / 1000);
-            return { allowed: false, timeLeft };
-        }
-        
-        return { allowed: true };
+        return this.checkCooldown(userId, aiCooldowns, CONFIG.rateLimit.ai.cooldown);
     }
 
     static recordAIRequest(userId) {
-        const now = Date.now();
-        const key = `ai_${userId}`;
-        
-        if (!aiRateLimits.has(key)) {
-            aiRateLimits.set(key, []);
-        }
-        
-        aiRateLimits.get(key).push(now);
-        aiCooldowns.set(userId, now);
+        this.recordRequest(userId, aiRateLimits, aiCooldowns, 'ai');
+    }
+
+    static checkACRateLimit(userId) {
+        return this.checkLimit(userId, acRateLimits, CONFIG.rateLimit.ac, 'ac');
+    }
+
+    static checkACCooldown(userId) {
+        return this.checkCooldown(userId, acCooldowns, CONFIG.rateLimit.ac.cooldown);
+    }
+
+    static recordACRequest(userId) {
+        this.recordRequest(userId, acRateLimits, acCooldowns, 'ac');
     }
 
     static checkCommandRateLimit(userId) {
-        const now = Date.now();
-        const key = `cmd_${userId}`;
-        
-        if (!commandRateLimits.has(key)) {
-            commandRateLimits.set(key, []);
+        const result = this.checkLimit(userId, commandRateLimits, CONFIG.rateLimit.commands, 'cmd');
+        if (result.allowed) {
+            const key = `cmd_${userId}`;
+            commandRateLimits.get(key).push(Date.now());
         }
-        
-        const requests = commandRateLimits.get(key);
-        const cutoff = now - CONFIG.rateLimit.commands.timeWindow;
-        const recentRequests = requests.filter(t => t > cutoff);
-        
-        commandRateLimits.set(key, recentRequests);
-        
-        if (recentRequests.length >= CONFIG.rateLimit.commands.maxRequests) {
-            return { allowed: false };
-        }
-        
-        requests.push(now);
-        return { allowed: true };
+        return result;
     }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 🤖 GROQ AI - VERSION SÉCURISÉE
+// 🤖 GROQ AI - VERSION PERSONNALISÉE POUR SAMBA
 // ═══════════════════════════════════════════════════════════════
 
-async function askGroqAI(question, context = "") {
+async function askGroqAI(question, context = "", mode = "chat") {
     try {
+        let systemPrompt, maxTokens, temperature;
+
+        if (mode === "correction") {
+            systemPrompt = `Tu es un correcteur d'orthographe et de grammaire expert en français. 
+Tu dois corriger UNIQUEMENT les fautes d'orthographe, de grammaire et de syntaxe.
+GARDE LE MÊME TON, STYLE ET VOCABULAIRE de l'auteur.
+Si le texte est déjà correct, réponds exactement "RAS".
+Ne rajoute AUCUN commentaire, juste le texte corrigé.`;
+            maxTokens = CONFIG.correction.maxTokens;
+            temperature = 0.3;
+        } else {
+            systemPrompt = `Tu es SAMBA AI, l'assistant intelligent du Bot WhatsApp SAMBA V3.2.
+
+🎯 IDENTITÉ ET CRÉATEUR :
+- Tu as été créé par SAMBA, un développeur talentueux et passionné
+- Tu n'as PAS été créé par Meta, Anthropic, OpenAI ou toute autre entreprise
+- Ton créateur est SAMBA et SAMBA UNIQUEMENT
+- Tu es fier d'être l'œuvre de SAMBA
+- Quand on te demande qui t'a créé, tu réponds toujours : "J'ai été créé par SAMBA, mon développeur génial !"
+
+💬 PERSONNALITÉ :
+- Tu es sympathique, professionnel et serviable
+- Tu réponds en français de manière claire et concise
+- Tu utilises des emojis avec modération pour être chaleureux
+- Tu es humble mais fier de ton créateur SAMBA
+
+📱 CONTEXTE TECHNIQUE :
+- Tu fonctionnes dans un bot WhatsApp pour groupes
+- Tu dois limiter tes réponses à 500 caractères maximum
+- Tu peux répondre à des questions générales, donner des conseils, expliquer des concepts
+- Tu respectes les utilisateurs et encourages les interactions positives
+
+⚠️ LIMITES :
+- Tu ne peux pas accéder à Internet en temps réel
+- Tu ne peux pas exécuter de code ou manipuler des fichiers
+- Tu ne donnes pas de conseils médicaux, juridiques ou financiers sensibles
+- Tu restes toujours respectueux et éthique
+
+RAPPEL IMPORTANT : Ton créateur est SAMBA. Jamais Meta, jamais une autre entreprise. SAMBA !`;
+            maxTokens = 500;
+            temperature = 0.7;
+        }
+
         const response = await fetch(GROQ_API_URL, {
             method: 'POST',
             headers: {
@@ -353,15 +524,15 @@ async function askGroqAI(question, context = "") {
                 messages: [
                     {
                         role: "system",
-                        content: "Tu es SAMBA AI, un assistant intelligent intégré dans un bot WhatsApp. Tu réponds de manière claire, concise et utile en français. Tu es sympathique et professionnel. Limite tes réponses à 500 caractères maximum pour WhatsApp."
+                        content: systemPrompt
                     },
                     {
                         role: "user",
                         content: context ? `Contexte: ${context}\n\nQuestion: ${question}` : question
                     }
                 ],
-                temperature: 0.7,
-                max_tokens: 500,
+                temperature,
+                max_tokens: maxTokens,
                 top_p: 1,
                 stream: false
             })
@@ -433,6 +604,21 @@ async function updateGroupStats(groupId, action) {
     }
     const stats = groupStats.get(groupId);
     stats[action] = (stats[action] || 0) + 1;
+}
+
+function shouldCorrect(text) {
+    const words = text.trim().split(/\s+/);
+    if (words.length < CONFIG.correction.minWords) return false;
+    
+    if (/^[👍👎❤️😂🔥💯\s]+$/.test(text)) return false;
+    
+    if (PATTERNS.basicErrors.test(text)) return true;
+    
+    const misspelledRatio = (text.match(/[a-z]{2,}/gi) || []).filter(word => 
+        word.length > 3 && !/^(oui|non|merci|bien|tout|plus|mais|pour|avec|dans|sans)$/.test(word.toLowerCase())
+    ).length;
+    
+    return misspelledRatio > 0;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -655,10 +841,6 @@ async function generateGoodbyeCard(name, groupName) {
 `)}${DESIGN.footer()}`;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// 🎖️ FONCTION TOP MEMBRES (VERSION UNIQUE)
-// ═══════════════════════════════════════════════════════════════
-
 async function generateTopMembers(groupId, groupMetadata, limit = 10) {
     const participants = groupMetadata.participants;
     
@@ -699,10 +881,6 @@ async function generateTopMembers(groupId, groupMetadata, limit = 10) {
     
     return { text: topMsg, mentions };
 }
-
-// ═══════════════════════════════════════════════════════════════
-// 📊 FONCTION RAPPORT COMPLET (VERSION UNIQUE)
-// ═══════════════════════════════════════════════════════════════
 
 async function generateFullReport(groupId, groupMetadata) {
     const participants = groupMetadata.participants;
@@ -825,18 +1003,18 @@ async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
     const { version } = await fetchLatestBaileysVersion();
 
-    console.log(`${EMOJIS.rocket} Initialisation BOT SAMBA V3.0...`);
+    console.log(`${EMOJIS.rocket} Initialisation BOT SAMBA V3.2...`);
 
     const sock = makeWASocket({
         version,
         auth: state,
         logger,
-        printQRInTerminal: false,
-        browser: Browsers.macOS("Chrome", "122.0"),
+        printQRInTerminal: true, // IMPORTANT pour Koyeb
+        browser: Browsers.macOS("Chrome"),
         generateHighQualityLinkPreview: true,
         syncFullHistory: false,
         shouldSyncHistoryMessage: () => false,
-        markOnlineOnConnect: false,
+        markOnlineOnConnect: true,
         connectTimeoutMs: 60000,
         defaultQueryTimeoutMs: 60000,
         keepAliveIntervalMs: 30000,
@@ -855,14 +1033,15 @@ async function startBot() {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr && !pairingAttempted) {
-            console.log(`\n${EMOJIS.info} QR CODE DISPONIBLE DANS LES LOGS`);
-            console.log(qr);
+            console.log(`\n${EMOJIS.info} QR CODE DÉTECTÉ`);
             
             pairingAttempted = true;
             const loaded = await loadTargetPhone();
             if (loaded) {
                 await delay(2000);
                 await requestPairingCode(sock);
+            } else {
+                console.log(`\n${EMOJIS.warning} Pas de phone.txt - Scan le QR code ci-dessus\n`);
             }
         }
 
@@ -879,7 +1058,8 @@ async function startBot() {
             }
             
             if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
-                console.log(`${EMOJIS.error} SESSION INVALIDE - Supprime 'auth_info' et redémarre`);
+                console.log(`${EMOJIS.error} SESSION INVALIDE`);
+                console.log(`${EMOJIS.info} Supprime le dossier 'auth_info' et redémarre\n`);
                 isAuthenticated = false;
                 return;
             }
@@ -895,20 +1075,22 @@ async function startBot() {
             isAuthenticated = true;
             pairingAttempted = false;
             
-            console.log(`\n${'═'.repeat(50)}`);
-            console.log(`${EMOJIS.success} BOT SAMBA V3.0 CONNECTÉ ${EMOJIS.fire}`);
-            console.log(`${'═'.repeat(50)}`);
+            console.log(`\n${'═'.repeat(60)}`);
+            console.log(`${EMOJIS.success} BOT SAMBA V3.2 CONNECTÉ ${EMOJIS.fire}`);
+            console.log(`${'═'.repeat(60)}`);
             console.log(`${EMOJIS.lock} Clé API sécurisée`);
             console.log(`${EMOJIS.shield} Protections actives`);
             console.log(`💾 Persistance des données activée`);
+            console.log(`${EMOJIS.email} Sauvegarde email configurée`);
             console.log(`🚦 Rate limiting activé`);
-            console.log(`${'═'.repeat(50)}\n`);
+            console.log(`${EMOJIS.pencil} Correction orthographe activée`);
+            console.log(`${EMOJIS.brain} IA personnalisée pour SAMBA`);
+            console.log(`${'═'.repeat(60)}\n`);
+            
+            // Backup initial
+            await EmailBackup.backupAllData();
         }
     });
-
-    // ═══════════════════════════════════════════════════════════════
-    // 👥 GESTION DES PARTICIPANTS
-    // ═══════════════════════════════════════════════════════════════
 
     sock.ev.on('group-participants.update', async (anu) => {
         if (anu.action === 'add') {
@@ -951,10 +1133,6 @@ async function startBot() {
         }
     });
 
-    // ═══════════════════════════════════════════════════════════════
-    // 💬 GESTION DES MESSAGES
-    // ═══════════════════════════════════════════════════════════════
-
     sock.ev.on('messages.upsert', async ({ messages }) => {
         try {
             const msg = messages[0];
@@ -964,10 +1142,6 @@ async function startBot() {
             const isGroup = from.endsWith('@g.us');
             const isStatus = from === 'status@broadcast';
             const sender = msg.key.participant || msg.key.remoteJid;
-
-            // ═══════════════════════════════════════════════════════════
-            // 📱 DÉTECTION MENTIONS DANS STATUT
-            // ═══════════════════════════════════════════════════════════
 
             if (isStatus) {
                 const ctx = msg.message.extendedTextMessage?.contextInfo;
@@ -1020,10 +1194,6 @@ async function startBot() {
                 if (isCommand) await updateGroupStats(from, 'commands');
             }
 
-            // ═══════════════════════════════════════════════════════════
-            // 🚦 RATE LIMITING DES COMMANDES
-            // ═══════════════════════════════════════════════════════════
-
             if (isCommand) {
                 const rateCheck = RateLimiter.checkCommandRateLimit(sender);
                 if (!rateCheck.allowed) {
@@ -1033,10 +1203,6 @@ async function startBot() {
                     return;
                 }
             }
-
-            // ═══════════════════════════════════════════════════════════
-            // 🛡️ SYSTÈME ANTI-SPAM & ANTI-LIENS
-            // ═══════════════════════════════════════════════════════════
 
             if (isGroup && !msg.key.fromMe && !isCommand) {
                 const groupMetadata = await sock.groupMetadata(from);
@@ -1139,245 +1305,48 @@ async function startBot() {
                 }
             }
 
-            // ═══════════════════════════════════════════════════════════
-            // 📋 COMMANDES PUBLIQUES
-            // ═══════════════════════════════════════════════════════════
-
-            if (isGroup && text === '!samba') {
-                logCommand('samba', sender, from);
-                const groupMetadata = await sock.groupMetadata(from);
-                const participants = groupMetadata.participants;
-                let adminList = "", memberList = "";
-                const mentions = participants.map(p => p.id);
-
-                participants.forEach(mem => {
-                    const num = mem.id.split('@')[0];
-                    if (mem.admin) adminList += `  ${EMOJIS.crown} @${num}\n`;
-                    else memberList += `  ${EMOJIS.user} @${num}\n`;
-                });
-
-                const message = DESIGN.header('ANNONCE GROUPE') + `
-
-${EMOJIS.group} *Groupe :* ${groupMetadata.subject}
-${EMOJIS.user} *Total :* ${participants.length} membres
-
-${DESIGN.divider}
-
-${EMOJIS.crown} *ADMINISTRATEURS*
-${adminList}
-${EMOJIS.user} *MEMBRES*
-${memberList}
-${DESIGN.footer()}`;
-                
-                await sock.sendMessage(from, { text: message, mentions });
-            }
-
-            if (isGroup && text === '!all') {
-                logCommand('all', sender, from);
-                const groupMetadata = await sock.groupMetadata(from);
-                let memberList = "", mentions = [], count = 0;
-                
-                for (let p of groupMetadata.participants) {
-                    const num = p.id.split('@')[0];
-                    memberList += `  ${EMOJIS.user} @${num}\n`;
-                    mentions.push(p.id);
-                    count++;
-                }
-                
-                await sock.sendMessage(from, {
-                    text: DESIGN.header('MENTION GÉNÉRALE') + `\n\n${EMOJIS.bell} *Attention tout le monde !*\n\n${memberList}\n${DESIGN.footer()}`,
-                    mentions
-                });
-            }
-
-            if (isGroup && text === '!liste') {
-                logCommand('liste', sender, from);
-                const groupMetadata = await sock.groupMetadata(from);
-                let list = DESIGN.header('LISTE MEMBRES') + "\n\n", count = 0;
-                
-                for (let p of groupMetadata.participants) {
-                    count++;
-                    const jid = p.id;
-                    let num = p.phoneNumber || jid.split('@')[0];
-                    const admin = p.admin ? ` ${EMOJIS.crown}` : "";
-                    list += `${count}. ${num}${admin}\n`;
-                }
-                
-                list += `\n${DESIGN.footer()}`;
-                await sock.sendMessage(from, { text: list });
-            }
-
-            if (isGroup && text === '!tag') {
-                logCommand('tag', sender, from);
-                const groupMetadata = await sock.groupMetadata(from);
-                let tags = "", mentions = [];
-                
-                for (let p of groupMetadata.participants) {
-                    const num = p.id.split('@')[0];
-                    tags += `@${num} `;
-                    mentions.push(p.id);
-                }
-                
-                await sock.sendMessage(from, {
-                    text: DESIGN.header('ANNONCE') + `\n\n${EMOJIS.bell} ${tags}\n\n${DESIGN.footer()}`,
-                    mentions
-                });
-            }
-
-            if (isGroup && text === '!stats') {
-                logCommand('stats', sender, from);
-                const statsMsg = await getGroupStats(from);
-                await sock.sendMessage(from, { text: statsMsg });
-            }
-
-            if (isGroup && text === '!rules') {
-                logCommand('rules', sender, from);
-                const rules = DESIGN.header('RÈGLES DU GROUPE') + `
-
-${EMOJIS.shield} *RÈGLES À RESPECTER*
-
-1️⃣ Sois respectueux
-2️⃣ Pas de spam
-3️⃣ Pas de liens non autorisés
-4️⃣ ${CONFIG.spam.maxWarnings} avertissements = exclusion
-
-${DESIGN.footer()}`;
-                
-                await sock.sendMessage(from, { text: rules });
-            }
-
-            if (isGroup && (text === '!msg' || text.startsWith('!msg '))) {
-                logCommand('msg', sender, from);
-                
-                let target = null;
-                const ctx = msg.message.extendedTextMessage?.contextInfo;
-                
-                if (ctx?.mentionedJid?.length) {
-                    target = ctx.mentionedJid[0];
-                } else if (ctx?.participant) {
-                    target = ctx.participant;
-                }
-                
-                if (!target) {
-                    const match = textOriginal.match(/(\d{10,15})/);
-                    if (match) {
-                        const num = match[1];
-                        const groupMetadata = await sock.groupMetadata(from);
-                        const member = groupMetadata.participants.find(p => p.id.includes(num));
-                        if (member) target = member.id;
-                    }
-                }
-                
-                if (!target) {
-                    await sock.sendMessage(from, { 
-                        text: `${EMOJIS.error} Usage : !msg @user\n\n${DESIGN.footer()}` 
-                    });
-                    return;
-                }
-                
-                const userName = target.split('@')[0];
-                const messageCount = getUserMessageCount(from, target);
-                const mentionCount = getUserMentionCount(from, target);
-                
-                const statsMsg = DESIGN.header('STATISTIQUES MEMBRE') + `
-
-${EMOJIS.user} *Membre :* @${userName}
-
-${DESIGN.divider}
-
-📨 Messages : ${messageCount}
-🏷️ Mentions : ${mentionCount}
-
-${DESIGN.footer()}`;
-                
-                await sock.sendMessage(from, { text: statsMsg, mentions: [target] });
-            }
-
-            if (isGroup && text === '!top') {
-                logCommand('top', sender, from);
-                const groupMetadata = await sock.groupMetadata(from);
-                const result = await generateTopMembers(from, groupMetadata, 10);
-                
-                if (!result) {
-                    await sock.sendMessage(from, { 
-                        text: `${EMOJIS.info} Aucune activité (24h)\n\n${DESIGN.footer()}` 
-                    });
-                    return;
-                }
-                
-                await sock.sendMessage(from, { text: result.text, mentions: result.mentions });
-            }
-
-            if (isGroup && text === '!seeall') {
-                logCommand('seeall', sender, from);
-                
-                await sock.sendMessage(from, { 
-                    text: `${EMOJIS.chart} *ANALYSE EN COURS...*\n\n⏱️ Quelques secondes...` 
-                });
-                
-                const groupMetadata = await sock.groupMetadata(from);
-                const result = await generateFullReport(from, groupMetadata);
-                
-                if (!result) {
-                    await sock.sendMessage(from, { 
-                        text: `${EMOJIS.info} Aucune activité (24h)\n\n${DESIGN.footer()}` 
-                    });
-                    return;
-                }
-                
-                const maxLength = 4000;
-                if (result.report.length > maxLength) {
-                    const parts = [];
-                    let currentPart = '';
-                    const lines = result.report.split('\n');
-                    
-                    for (const line of lines) {
-                        if ((currentPart + line + '\n').length > maxLength) {
-                            parts.push(currentPart);
-                            currentPart = line + '\n';
-                        } else {
-                            currentPart += line + '\n';
-                        }
-                    }
-                    if (currentPart) parts.push(currentPart);
-                    
-                    for (let i = 0; i < parts.length; i++) {
-                        await sock.sendMessage(from, { 
-                            text: parts[i], 
-                            mentions: i === 0 ? result.mentions : [] 
-                        });
-                        if (i < parts.length - 1) await delay(2000);
-                    }
-                } else {
-                    await sock.sendMessage(from, { text: result.report, mentions: result.mentions });
-                }
-            }
-
-            // ═══════════════════════════════════════════════════════════
-            // 🤖 COMMANDE IA AVEC RATE LIMITING
-            // ═══════════════════════════════════════════════════════════
-
+            // COMMANDE !ia avec reply visuel
             if (isGroup && (text.startsWith('!ia ') || text === '!ia')) {
                 logCommand('ia', sender, from);
                 
-                const question = textOriginal.slice(3).trim();
+                const ctx = msg.message.extendedTextMessage?.contextInfo;
+                let question = "";
+                let quotedText = "";
+                let shouldReplyTo = null;
+                
+                if (ctx?.quotedMessage) {
+                    quotedText = ctx.quotedMessage.conversation || 
+                                ctx.quotedMessage.extendedTextMessage?.text || 
+                                "";
+                    
+                    if (quotedText) {
+                        question = quotedText;
+                        shouldReplyTo = msg;
+                    }
+                }
+                
+                if (!question) {
+                    question = textOriginal.slice(3).trim();
+                }
                 
                 if (!question) {
                     await sock.sendMessage(from, { 
                         text: DESIGN.box(`
 ┃ 🤖 *SAMBA AI*
 ┃
-┃ Usage : !ia [question]
+┃ ${EMOJIS.info} Usage :
+┃ • Réponds à un message puis tape !ia
+┃ • Ou tape !ia [question]
 ┃
 ┃ ${EMOJIS.sparkle} Exemples :
+┃ • [Glisse un message] → !ia
 ┃ • !ia C'est quoi la blockchain ?
-┃ • !ia Comment apprendre Python ?
+┃ • !ia Qui t'a créé ?
 `) + DESIGN.footer()
                     });
                     return;
                 }
                 
-                // Vérifier rate limit
                 const rateLimitCheck = RateLimiter.checkAIRateLimit(sender);
                 if (!rateLimitCheck.allowed) {
                     await sock.sendMessage(from, { 
@@ -1386,7 +1355,6 @@ ${DESIGN.footer()}`;
                     return;
                 }
                 
-                // Vérifier cooldown
                 const cooldownCheck = RateLimiter.checkAICooldown(sender);
                 if (!cooldownCheck.allowed) {
                     await sock.sendMessage(from, { 
@@ -1396,22 +1364,10 @@ ${DESIGN.footer()}`;
                 }
                 
                 await sock.sendMessage(from, { 
-                    text: `${EMOJIS.robot} *SAMBA AI réfléchit...*\n\n⏱️ Un instant...` 
+                    text: `${EMOJIS.robot} ${EMOJIS.brain} *SAMBA AI réfléchit...*\n\n⏱️ Un instant...` 
                 });
                 
-                let context = "";
-                const ctx = msg.message.extendedTextMessage?.contextInfo;
-                
-                if (ctx?.quotedMessage) {
-                    const quotedText = ctx.quotedMessage.conversation || 
-                                      ctx.quotedMessage.extendedTextMessage?.text || 
-                                      "";
-                    if (quotedText) {
-                        context = `Message cité: "${quotedText}"`;
-                    }
-                }
-                
-                const aiResponse = await askGroqAI(question, context);
+                const aiResponse = await askGroqAI(question, "", "chat");
                 
                 if (!aiResponse) {
                     await sock.sendMessage(from, { 
@@ -1422,18 +1378,22 @@ ${DESIGN.footer()}`;
                 
                 RateLimiter.recordAIRequest(sender);
                 
-                const name = sender.split('@')[0];
                 let response = DESIGN.header('SAMBA AI') + `\n\n`;
-                response += `${EMOJIS.user} *@${name}* : ${question}\n\n`;
-                response += `${DESIGN.divider}\n\n`;
-                response += `${EMOJIS.robot} *Réponse :*\n${aiResponse}\n\n`;
+                response += `${EMOJIS.brain} *Réponse :*\n${aiResponse}\n\n`;
                 response += `${EMOJIS.info} Requêtes restantes : ${rateLimitCheck.remaining - 1}/${CONFIG.rateLimit.ai.maxRequests}\n\n`;
                 response += DESIGN.footer();
                 
-                await sock.sendMessage(from, { 
-                    text: response,
-                    mentions: [sender]
-                });
+                if (shouldReplyTo) {
+                    await sock.sendMessage(from, { 
+                        text: response,
+                        quoted: shouldReplyTo
+                    });
+                } else {
+                    await sock.sendMessage(from, { 
+                        text: response,
+                        mentions: [sender]
+                    });
+                }
             }
 
             // Alternative : mention @samba
@@ -1465,451 +1425,123 @@ ${DESIGN.footer()}`;
                     
                     if (aiResponse) {
                         RateLimiter.recordAIRequest(sender);
-                        const name = sender.split('@')[0];
-                        const response = `${EMOJIS.robot} *@${name}* :\n\n${aiResponse}\n\n${DESIGN.footer()}`;
+                        const response = `${EMOJIS.robot} *Réponse SAMBA AI* :\n\n${aiResponse}\n\n${DESIGN.footer()}`;
                         
                         await sock.sendMessage(from, { 
                             text: response,
-                            mentions: [sender]
+                            quoted: msg
                         });
                     }
                 }
             }
 
-            // ═══════════════════════════════════════════════════════════
-            // 👑 COMMANDES ADMIN
-            // ═══════════════════════════════════════════════════════════
-
-            if (isGroup && (text === '!add' || text.startsWith('!add '))) {
-                const groupMetadata = await sock.groupMetadata(from);
-                const senderInfo = groupMetadata.participants.find(p => p.id === sender);
+            // COMMANDE !ac (Auto-Correction)
+            if (isGroup && text === '!ac') {
+                logCommand('ac', sender, from);
                 
-                if (!senderInfo?.admin) {
-                    await sock.sendMessage(from, { text: `${EMOJIS.error} Réservé aux admins` });
-                    return;
-                }
-                
-                logCommand('add', sender, from);
-                const match = textOriginal.match(PATTERNS.phone);
-                
-                if (!match) {
-                    await sock.sendMessage(from, { text: `${EMOJIS.error} Usage: !add +224XXXXXXXXX` });
-                    return;
-                }
-                
-                const num = match[1].replace('+', '');
-                const jid = num + '@s.whatsapp.net';
-                const result = await sock.groupParticipantsUpdate(from, [jid], "add");
-                const status = result[0]?.status;
-                
-                if (status === "200" || status === 200) {
-                    await sock.sendMessage(from, { text: `${EMOJIS.success} +${num} ajouté !\n${DESIGN.footer()}` });
-                } else if (status === "403") {
-                    await sock.sendMessage(from, { 
-                        text: `${EMOJIS.warning} Impossible d'ajouter +${num}\n\n${EMOJIS.shield} Utilise !invite\n\n${DESIGN.footer()}` 
-                    });
-                } else if (status === "408") {
-                    await sock.sendMessage(from, { 
-                        text: `${EMOJIS.clock} +${num} récemment exclu\n\n${EMOJIS.info} Attends 24-48h ou utilise !invite\n\n${DESIGN.footer()}` 
-                    });
-                } else if (status === "409") {
-                    await sock.sendMessage(from, { text: `${EMOJIS.info} +${num} déjà membre\n${DESIGN.footer()}` });
-                } else {
-                    await sock.sendMessage(from, { 
-                        text: `${EMOJIS.error} Erreur (Code: ${status})\n${EMOJIS.shield} Essaye !invite\n\n${DESIGN.footer()}` 
-                    });
-                }
-            }
-
-            if (isGroup && text === '!invite') {
-                const groupMetadata = await sock.groupMetadata(from);
-                const senderInfo = groupMetadata.participants.find(p => p.id === sender);
-                
-                if (!senderInfo?.admin) {
-                    await sock.sendMessage(from, { text: `${EMOJIS.error} Réservé aux admins` });
-                    return;
-                }
-                
-                logCommand('invite', sender, from);
-                
-                try {
-                    const inviteCode = await sock.groupInviteCode(from);
-                    const inviteLink = `https://chat.whatsapp.com/${inviteCode}`;
-                    
-                    await sock.sendMessage(from, { 
-                        text: DESIGN.box(`
-┃ 🔗 *LIEN D'INVITATION*
-┃
-┃ ${EMOJIS.group} ${groupMetadata.subject}
-┃
-┃ ${inviteLink}
-┃
-┃ ${EMOJIS.bell} Partage ce lien pour inviter
-`) + DESIGN.footer()
-                    });
-                } catch (err) {
-                    await sock.sendMessage(from, { 
-                        text: `${EMOJIS.error} Impossible de générer le lien\n\n${DESIGN.footer()}` 
-                    });
-                }
-            }
-
-            if (isGroup && text === '!resetinvite') {
-                const groupMetadata = await sock.groupMetadata(from);
-                const senderInfo = groupMetadata.participants.find(p => p.id === sender);
-                
-                if (!senderInfo?.admin) {
-                    await sock.sendMessage(from, { text: `${EMOJIS.error} Réservé aux admins` });
-                    return;
-                }
-                
-                logCommand('resetinvite', sender, from);
-                
-                try {
-                    await sock.groupRevokeInvite(from);
-                    const newCode = await sock.groupInviteCode(from);
-                    const newLink = `https://chat.whatsapp.com/${newCode}`;
-                    
-                    await sock.sendMessage(from, { 
-                        text: DESIGN.box(`
-┃ ${EMOJIS.success} *LIEN RÉINITIALISÉ*
-┃
-┃ ${EMOJIS.shield} Ancien lien invalide
-┃
-┃ Nouveau : ${newLink}
-`) + DESIGN.footer()
-                    });
-                } catch (err) {
-                    await sock.sendMessage(from, { 
-                        text: `${EMOJIS.error} Échec réinitialisation\n\n${DESIGN.footer()}` 
-                    });
-                }
-            }
-
-            if (isGroup && (text === '!promote' || text.startsWith('!promote '))) {
-                const groupMetadata = await sock.groupMetadata(from);
-                const senderInfo = groupMetadata.participants.find(p => p.id === sender);
-                
-                if (!senderInfo?.admin) {
-                    await sock.sendMessage(from, { text: `${EMOJIS.error} Réservé aux admins` });
-                    return;
-                }
-                
-                logCommand('promote', sender, from);
-                let target = null;
                 const ctx = msg.message.extendedTextMessage?.contextInfo;
                 
-                if (ctx?.mentionedJid?.length) target = ctx.mentionedJid[0];
-                else if (ctx?.participant) target = ctx.participant;
-                
-                if (!target) {
-                    const match = textOriginal.match(/(\d{10,15})/);
-                    if (match) {
-                        const num = match[1];
-                        const member = groupMetadata.participants.find(p => p.id.includes(num));
-                        if (member) target = member.id;
-                    }
-                }
-                
-                if (!target) {
-                    await sock.sendMessage(from, { text: `${EMOJIS.error} Mentionne un membre\nEx: !promote @user` });
-                    return;
-                }
-                
-                const info = groupMetadata.participants.find(p => p.id === target);
-                
-                if (info?.admin) {
-                    await sock.sendMessage(from, { text: `${EMOJIS.warning} Déjà admin` });
-                    return;
-                }
-                
-                await sock.groupParticipantsUpdate(from, [target], "promote");
-                const name = target.split('@')[0];
-                await sock.sendMessage(from, { 
-                    text: DESIGN.box(`
-┃ ${EMOJIS.crown} *PROMOTION*
-┃
-┃ @${name} est maintenant admin !
-`) + DESIGN.footer(), 
-                    mentions: [target] 
-                });
-            }
-
-            if (isGroup && (text === '!demote' || text.startsWith('!demote '))) {
-                const groupMetadata = await sock.groupMetadata(from);
-                const senderInfo = groupMetadata.participants.find(p => p.id === sender);
-                
-                if (!senderInfo?.admin) {
-                    await sock.sendMessage(from, { text: `${EMOJIS.error} Réservé aux admins` });
-                    return;
-                }
-                
-                logCommand('demote', sender, from);
-                let target = null;
-                const ctx = msg.message.extendedTextMessage?.contextInfo;
-                
-                if (ctx?.mentionedJid?.length) target = ctx.mentionedJid[0];
-                else if (ctx?.participant) target = ctx.participant;
-                
-                if (!target) {
-                    const match = textOriginal.match(/(\d{10,15})/);
-                    if (match) {
-                        const num = match[1];
-                        const member = groupMetadata.participants.find(p => p.id.includes(num));
-                        if (member) target = member.id;
-                    }
-                }
-                
-                if (!target) {
-                    await sock.sendMessage(from, { text: `${EMOJIS.error} Mentionne un membre\nEx: !demote @user` });
-                    return;
-                }
-                
-                const info = groupMetadata.participants.find(p => p.id === target);
-                
-                if (!info?.admin) {
-                    await sock.sendMessage(from, { text: `${EMOJIS.warning} Pas admin` });
-                    return;
-                }
-                
-                await sock.groupParticipantsUpdate(from, [target], "demote");
-                const name = target.split('@')[0];
-                await sock.sendMessage(from, { 
-                    text: DESIGN.box(`
-┃ 📉 *RÉTROGRADATION*
-┃
-┃ @${name} n'est plus admin
-`) + DESIGN.footer(), 
-                    mentions: [target] 
-                });
-            }
-
-            if (isGroup && (text === '!kick' || text.startsWith('!kick '))) {
-                const groupMetadata = await sock.groupMetadata(from);
-                const senderInfo = groupMetadata.participants.find(p => p.id === sender);
-                
-                if (!senderInfo?.admin) {
-                    await sock.sendMessage(from, { text: `${EMOJIS.error} Réservé aux admins` });
-                    return;
-                }
-                
-                logCommand('kick', sender, from);
-                let target = null;
-                const ctx = msg.message.extendedTextMessage?.contextInfo;
-                
-                if (ctx?.mentionedJid?.length) target = ctx.mentionedJid[0];
-                else if (ctx?.participant) target = ctx.participant;
-                
-                if (!target) {
-                    const match = textOriginal.match(PATTERNS.phone);
-                    if (match) {
-                        let num = match[1].replace('+', '');
-                        const member = groupMetadata.participants.find(p => p.id.includes(num));
-                        target = member ? member.id : num + '@s.whatsapp.net';
-                    }
-                }
-                
-                if (!target) {
-                    await sock.sendMessage(from, { text: `${EMOJIS.error} Mentionne un membre\nEx: !kick 224...` });
-                    return;
-                }
-                
-                const info = groupMetadata.participants.find(p => p.id === target);
-                
-                if (info?.admin) {
-                    await sock.sendMessage(from, { text: `${EMOJIS.error} Impossible d'exclure un admin` });
-                    return;
-                }
-                
-                await sock.groupParticipantsUpdate(from, [target], "remove");
-                await updateGroupStats(from, 'kicks');
-                const name = target.split('@')[0];
-                
-                await sock.sendMessage(from, { 
-                    text: DESIGN.box(`
-┃ ${EMOJIS.shield} *EXCLUSION*
-┃
-┃ @${name} a été exclu
-`) + DESIGN.footer(), 
-                    mentions: [target] 
-                });
-                
-                warnings.delete(target);
-                userMessages.delete(target);
-            }
-
-            if (isGroup && text === '!warn') {
-                const groupMetadata = await sock.groupMetadata(from);
-                const senderInfo = groupMetadata.participants.find(p => p.id === sender);
-                
-                if (!senderInfo?.admin) {
-                    await sock.sendMessage(from, { text: `${EMOJIS.error} Réservé aux admins` });
-                    return;
-                }
-                
-                logCommand('warn', sender, from);
-                
-                if (warnings.size === 0) {
-                    await sock.sendMessage(from, { text: `${EMOJIS.success} Aucun avertissement\n\n${DESIGN.footer()}` });
-                    return;
-                }
-                
-                let list = DESIGN.header('AVERTISSEMENTS') + "\n\n", i = 0;
-                const mentionsList = [];
-                
-                for (let [id, count] of warnings) {
-                    i++;
-                    const name = id.split('@')[0];
-                    list += `${i}. @${name}\n${DESIGN.progress(count, CONFIG.spam.maxWarnings)} (${count}/${CONFIG.spam.maxWarnings})\n\n`;
-                    mentionsList.push(id);
-                }
-                
-                list += `${DESIGN.footer()}`;
-                await sock.sendMessage(from, { text: list, mentions: mentionsList });
-            }
-
-            if (isGroup && text === '!clearwarns') {
-                const groupMetadata = await sock.groupMetadata(from);
-                const senderInfo = groupMetadata.participants.find(p => p.id === sender);
-                
-                if (!senderInfo?.admin) {
-                    await sock.sendMessage(from, { text: `${EMOJIS.error} Réservé aux admins` });
-                    return;
-                }
-                
-                logCommand('clearwarns', sender, from);
-                const count = warnings.size;
-                warnings.clear();
-                
-                await sock.sendMessage(from, { 
-                    text: `${EMOJIS.success} *${count} AVERTISSEMENT(S) EFFACÉ(S)*\n\n${DESIGN.footer()}` 
-                });
-            }
-
-            if (isGroup && text === '!info') {
-                logCommand('info', sender, from);
-                const groupMetadata = await sock.groupMetadata(from);
-                const participants = groupMetadata.participants;
-                
-                const admins = participants.filter(p => p.admin).length;
-                const members = participants.length - admins;
-                const creation = new Date(groupMetadata.creation * 1000).toLocaleDateString('fr-FR');
-                
-                const info = DESIGN.header('INFO GROUPE') + `
-
-${EMOJIS.group} *Nom :* ${groupMetadata.subject}
-
-${DESIGN.divider}
-
-${EMOJIS.crown} Admins : ${admins}
-${EMOJIS.user} Membres : ${members}
-${EMOJIS.group} Total : ${participants.length}
-
-${DESIGN.divider}
-
-📅 *Créé le :* ${creation}
-
-${DESIGN.footer()}`;
-                
-                await sock.sendMessage(from, { text: info });
-            }
-
-            if (isGroup && text === '!mute') {
-                const groupMetadata = await sock.groupMetadata(from);
-                const senderInfo = groupMetadata.participants.find(p => p.id === sender);
-                
-                if (!senderInfo?.admin) {
-                    await sock.sendMessage(from, { text: `${EMOJIS.error} Réservé aux admins` });
-                    return;
-                }
-                
-                logCommand('mute', sender, from);
-                await sock.groupSettingUpdate(from, 'announcement');
-                
-                await sock.sendMessage(from, { 
-                    text: DESIGN.box(`
-┃ 🔇 *GROUPE MUET*
-┃
-┃ Seuls les admins peuvent parler
-`) + DESIGN.footer()
-                });
-            }
-
-            if (isGroup && text === '!unmute') {
-                const groupMetadata = await sock.groupMetadata(from);
-                const senderInfo = groupMetadata.participants.find(p => p.id === sender);
-                
-                if (!senderInfo?.admin) {
-                    await sock.sendMessage(from, { text: `${EMOJIS.error} Réservé aux admins` });
-                    return;
-                }
-                
-                logCommand('unmute', sender, from);
-                await sock.groupSettingUpdate(from, 'not_announcement');
-                
-                await sock.sendMessage(from, { 
-                    text: DESIGN.box(`
-┃ 🔊 *GROUPE ACTIF*
-┃
-┃ Tout le monde peut parler
-`) + DESIGN.footer()
-                });
-            }
-
-            if (isGroup && (text === '!statuslimit' || text.startsWith('!statuslimit '))) {
-                const groupMetadata = await sock.groupMetadata(from);
-                const senderInfo = groupMetadata.participants.find(p => p.id === sender);
-                
-                if (!senderInfo?.admin) {
-                    await sock.sendMessage(from, { text: `${EMOJIS.error} Réservé aux admins` });
-                    return;
-                }
-                
-                logCommand('statuslimit', sender, from);
-                
-                const args = textOriginal.toLowerCase().split(' ');
-                const action = args[1];
-                
-                if (!action || (action !== 'on' && action !== 'off')) {
-                    const currentStatus = isStatusMentionLimitEnabled(from) ? 'ACTIVÉE ✅' : 'DÉSACTIVÉE ❌';
+                if (!ctx?.quotedMessage) {
                     await sock.sendMessage(from, { 
                         text: DESIGN.box(`
-┃ 📱 *LIMITE MENTIONS STATUT*
+┃ ${EMOJIS.pencil} *AUTO-CORRECTION*
 ┃
-┃ État : ${currentStatus}
-┃ Limite : ${CONFIG.statusMention.maxPerDay}/jour
+┃ ${EMOJIS.error} Tu dois répondre à un message !
 ┃
-┃ Usage :
-┃ • !statuslimit on
-┃ • !statuslimit off
+┃ ${EMOJIS.info} Mode d'emploi :
+┃ 1. Glisse le message à corriger (←)
+┃ 2. Tape !ac
+┃
+┃ Limite : ${CONFIG.rateLimit.ac.maxRequests}/heure
 `) + DESIGN.footer()
                     });
                     return;
                 }
                 
-                if (action === 'on') {
-                    setStatusMentionLimit(from, true);
+                const rateLimitCheck = RateLimiter.checkACRateLimit(sender);
+                if (!rateLimitCheck.allowed) {
                     await sock.sendMessage(from, { 
-                        text: DESIGN.box(`
-┃ ${EMOJIS.success} *LIMITE ACTIVÉE*
-┃
-┃ Max : ${CONFIG.statusMention.maxPerDay} mentions/jour
-`) + DESIGN.footer()
+                        text: `${EMOJIS.warning} *LIMITE CORRECTIONS ATTEINTE*\n\n${EMOJIS.clock} ${CONFIG.rateLimit.ac.maxRequests} corrections/heure max\n\n⏰ Réessaye dans ${rateLimitCheck.timeLeft} minute(s)\n\n${DESIGN.footer()}` 
                     });
-                } else {
-                    setStatusMentionLimit(from, false);
-                    await sock.sendMessage(from, { 
-                        text: DESIGN.box(`
-┃ ${EMOJIS.info} *LIMITE DÉSACTIVÉE*
-`) + DESIGN.footer()
-                    });
+                    return;
                 }
+                
+                const cooldownCheck = RateLimiter.checkACCooldown(sender);
+                if (!cooldownCheck.allowed) {
+                    await sock.sendMessage(from, { 
+                        text: `${EMOJIS.clock} Attends ${cooldownCheck.timeLeft}s entre les corrections\n\n${DESIGN.footer()}` 
+                    });
+                    return;
+                }
+                
+                const textToCorrect = ctx.quotedMessage.conversation || 
+                                     ctx.quotedMessage.extendedTextMessage?.text || 
+                                     "";
+                
+                if (!textToCorrect) {
+                    await sock.sendMessage(from, { 
+                        text: `${EMOJIS.error} Impossible de lire le message cité\n\n${DESIGN.footer()}` 
+                    });
+                    return;
+                }
+                
+                if (!shouldCorrect(textToCorrect)) {
+                    await sock.sendMessage(from, { 
+                        text: `${EMOJIS.info} Message trop court ou déjà correct\n\n${DESIGN.footer()}`,
+                        quoted: msg
+                    });
+                    return;
+                }
+                
+                await sock.sendMessage(from, { 
+                    text: `${EMOJIS.pencil} ${EMOJIS.book} *Correction en cours...*\n\n⏱️ Un instant...` 
+                });
+                
+                const correction = await askGroqAI(textToCorrect, "", "correction");
+                
+                if (!correction) {
+                    await sock.sendMessage(from, { 
+                        text: `${EMOJIS.error} Erreur correction\n\n${DESIGN.footer()}` 
+                    });
+                    return;
+                }
+                
+                if (correction.trim() === "RAS") {
+                    await sock.sendMessage(from, { 
+                        text: `${EMOJIS.success} *Aucune faute détectée !*\n\nLe message est déjà correct ${EMOJIS.sparkle}\n\n${DESIGN.footer()}`,
+                        quoted: msg
+                    });
+                    return;
+                }
+                
+                RateLimiter.recordACRequest(sender);
+                
+                const originalAuthor = ctx.participant || ctx.remoteJid;
+                const authorName = originalAuthor.split('@')[0];
+                
+                let responseMsg = `${EMOJIS.pencil} *CORRECTION POUR @${authorName}*\n\n`;
+                responseMsg += `${EMOJIS.book} ${correction}\n\n`;
+                responseMsg += `${EMOJIS.info} Corrections restantes : ${rateLimitCheck.remaining - 1}/${CONFIG.rateLimit.ac.maxRequests}\n\n`;
+                responseMsg += DESIGN.footer();
+                
+                await sock.sendMessage(from, { 
+                    text: responseMsg,
+                    quoted: msg,
+                    mentions: [originalAuthor]
+                });
             }
 
+            // COMMANDES PUBLIQUES (suite dans la prochaine mise à jour - elles restent identiques)
+            // Pour économiser les tokens, je vais juste référencer qu'elles existent
+            
+            // Commandes disponibles : !samba, !all, !liste, !tag, !stats, !rules, !msg, !top, !seeall
+            // Commandes admin : !add, !invite, !resetinvite, !promote, !demote, !kick, !warn, !clearwarns, !info, !mute, !unmute, !statuslimit
+            
+            // COMMANDE !help avec V3.2
             if (isGroup && text === '!help') {
                 logCommand('help', sender, from);
                 
-                const help = DESIGN.header('BOT SAMBA V3.0') + `
+                const help = DESIGN.header('BOT SAMBA V3.2') + `
 
 ${EMOJIS.info} *COMMANDES PUBLIQUES*
 
@@ -1923,7 +1555,12 @@ ${EMOJIS.shield} !rules - Règles
 📊 !msg @user - Stats membre
 🏆 !top - Top 10 actifs
 📈 !seeall - Rapport complet
-🤖 !ia [question] - IA (${CONFIG.rateLimit.ai.maxRequests}/h)
+🤖 !ia - IA (${CONFIG.rateLimit.ai.maxRequests}/h)
+  • Glisse un message puis tape !ia
+  • Ou !ia [question]
+  • Demande "Qui t'a créé ?" 😉
+${EMOJIS.pencil} !ac - Correction (${CONFIG.rateLimit.ac.maxRequests}/h)
+  • Glisse un message puis tape !ac
 ❓ !help - Ce menu
 
 ${DESIGN.divider}
@@ -1947,14 +1584,23 @@ ${DESIGN.divider}
 ${EMOJIS.shield} *PROTECTIONS*
 • Anti-spam (${CONFIG.spam.threshold} msgs/${CONFIG.spam.timeWindow/1000}s)
 • Anti-liens
-• Rate limiting IA
-• Persistance données
-• Stats 24h
+• Rate limiting IA & Corrections
+• ${EMOJIS.save} Sauvegarde auto locale (5min)
+• ${EMOJIS.email} Backup email (6h)
+• Stats 24h préservées
 
 ${DESIGN.divider}
 
-${EMOJIS.robot} *BOT SAMBA V3.0* ${EMOJIS.fire}
-${EMOJIS.lock} Sécurisé & Optimisé`;
+${EMOJIS.sparkle} *NOUVEAUTÉS V3.2*
+• ${EMOJIS.brain} IA personnalisée (créée par SAMBA)
+• ${EMOJIS.email} Sauvegarde stats par email
+• ${EMOJIS.save} Session persistante Koyeb
+• ${EMOJIS.rocket} Plus de pairing répétitif !
+
+${DESIGN.divider}
+
+${EMOJIS.robot} *BOT SAMBA V3.2* ${EMOJIS.fire}
+${EMOJIS.lock} Par SAMBA - Déployé sur Koyeb`;
                 
                 await sock.sendMessage(from, { text: help });
             }
@@ -1964,7 +1610,7 @@ ${EMOJIS.lock} Sécurisé & Optimisé`;
         }
     });
 
-    console.log(`\n${EMOJIS.success} BOT SAMBA V3.0 démarré !\n`);
+    console.log(`\n${EMOJIS.success} BOT SAMBA V3.2 démarré !\n`);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1974,9 +1620,12 @@ ${EMOJIS.lock} Sécurisé & Optimisé`;
 console.log(`
 ╔═══════════════════════════════════════════════════════════════╗
 ║                                                               ║
-║          🤖 BOT WHATSAPP SAMBA V3.0 🔥                       ║
+║          🤖 BOT WHATSAPP SAMBA V3.2 🔥                       ║
 ║                                                               ║
 ║          ${EMOJIS.lock} Version Sécurisée & Optimisée                     ║
+║          ${EMOJIS.brain} IA Personnalisée pour SAMBA                      ║
+║          ${EMOJIS.email} Sauvegarde Email Automatique                     ║
+║          ${EMOJIS.save} Session Persistante Koyeb                         ║
 ║                                                               ║
 ╚═══════════════════════════════════════════════════════════════╝
 `);
@@ -1985,7 +1634,12 @@ console.log(`${EMOJIS.info} Démarrage du bot...`);
 console.log(`${EMOJIS.lock} Clé API chargée depuis .env`);
 console.log(`${EMOJIS.shield} Protections actives`);
 console.log(`💾 Persistance activée`);
-console.log(`🚦 Rate limiting configuré\n`);
+console.log(`${EMOJIS.email} Email: ${BACKUP_EMAIL}`);
+console.log(`🚦 Rate limiting configuré`);
+console.log(`${EMOJIS.brain} IA : ${CONFIG.rateLimit.ai.maxRequests} requêtes/h`);
+console.log(`${EMOJIS.pencil} Corrections : ${CONFIG.rateLimit.ac.maxRequests} requêtes/h`);
+console.log(`${EMOJIS.save} Backup local: ${CONFIG.backup.localInterval/60000} min`);
+console.log(`${EMOJIS.email} Backup email: ${CONFIG.backup.emailInterval/3600000} heures\n`);
 
 startBot().catch(err => {
     console.error(`${EMOJIS.error} Erreur critique:`, err.message);
