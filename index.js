@@ -1531,12 +1531,646 @@ async function startBot() {
                 });
             }
 
-            // COMMANDES PUBLIQUES (suite dans la prochaine mise à jour - elles restent identiques)
-            // Pour économiser les tokens, je vais juste référencer qu'elles existent
+            // COMMANDES PUBLIQUES COMPLÈTES
             
-            // Commandes disponibles : !samba, !all, !liste, !tag, !stats, !rules, !msg, !top, !seeall
-            // Commandes admin : !add, !invite, !resetinvite, !promote, !demote, !kick, !warn, !clearwarns, !info, !mute, !unmute, !statuslimit
-            
+            if (isGroup && text === '!samba') {
+                logCommand('samba', sender, from);
+                const groupMetadata = await sock.groupMetadata(from);
+                const participants = groupMetadata.participants;
+                let adminList = "", memberList = "";
+                const mentions = participants.map(p => p.id);
+
+                participants.forEach(mem => {
+                    const num = mem.id.split('@')[0];
+                    if (mem.admin) adminList += `  ${EMOJIS.crown} @${num}\n`;
+                    else memberList += `  ${EMOJIS.user} @${num}\n`;
+                });
+
+                const message = DESIGN.header('ANNONCE GROUPE') + `
+
+${EMOJIS.group} *Groupe :* ${groupMetadata.subject}
+${EMOJIS.user} *Total :* ${participants.length} membres
+
+${DESIGN.divider}
+
+${EMOJIS.crown} *ADMINISTRATEURS*
+${adminList}
+${EMOJIS.user} *MEMBRES*
+${memberList}
+${DESIGN.footer()}`;
+                
+                await sock.sendMessage(from, { text: message, mentions });
+            }
+
+            if (isGroup && text === '!all') {
+                logCommand('all', sender, from);
+                const groupMetadata = await sock.groupMetadata(from);
+                let memberList = "", mentions = [], count = 0;
+                
+                for (let p of groupMetadata.participants) {
+                    const num = p.id.split('@')[0];
+                    memberList += `  ${EMOJIS.user} @${num}\n`;
+                    mentions.push(p.id);
+                    count++;
+                }
+                
+                await sock.sendMessage(from, {
+                    text: DESIGN.header('MENTION GÉNÉRALE') + `\n\n${EMOJIS.bell} *Attention tout le monde !*\n\n${memberList}\n${DESIGN.footer()}`,
+                    mentions
+                });
+            }
+
+            if (isGroup && text === '!liste') {
+                logCommand('liste', sender, from);
+                const groupMetadata = await sock.groupMetadata(from);
+                let list = DESIGN.header('LISTE MEMBRES') + "\n\n", count = 0;
+                
+                for (let p of groupMetadata.participants) {
+                    count++;
+                    const jid = p.id;
+                    let num = p.phoneNumber || jid.split('@')[0];
+                    const admin = p.admin ? ` ${EMOJIS.crown}` : "";
+                    list += `${count}. ${num}${admin}\n`;
+                }
+                
+                list += `\n${DESIGN.footer()}`;
+                await sock.sendMessage(from, { text: list });
+            }
+
+            if (isGroup && text === '!tag') {
+                logCommand('tag', sender, from);
+                const groupMetadata = await sock.groupMetadata(from);
+                let tags = "", mentions = [];
+                
+                for (let p of groupMetadata.participants) {
+                    const num = p.id.split('@')[0];
+                    tags += `@${num} `;
+                    mentions.push(p.id);
+                }
+                
+                await sock.sendMessage(from, {
+                    text: DESIGN.header('ANNONCE') + `\n\n${EMOJIS.bell} ${tags}\n\n${DESIGN.footer()}`,
+                    mentions
+                });
+            }
+
+            if (isGroup && text === '!stats') {
+                logCommand('stats', sender, from);
+                const statsMsg = await getGroupStats(from);
+                await sock.sendMessage(from, { text: statsMsg });
+            }
+
+            if (isGroup && text === '!rules') {
+                logCommand('rules', sender, from);
+                const rules = DESIGN.header('RÈGLES DU GROUPE') + `
+
+${EMOJIS.shield} *RÈGLES À RESPECTER*
+
+1️⃣ Sois respectueux
+2️⃣ Pas de spam
+3️⃣ Pas de liens non autorisés
+4️⃣ ${CONFIG.spam.maxWarnings} avertissements = exclusion
+
+${DESIGN.footer()}`;
+                
+                await sock.sendMessage(from, { text: rules });
+            }
+
+            if (isGroup && (text === '!msg' || text.startsWith('!msg '))) {
+                logCommand('msg', sender, from);
+                
+                let target = null;
+                const ctx = msg.message.extendedTextMessage?.contextInfo;
+                
+                if (ctx?.mentionedJid?.length) {
+                    target = ctx.mentionedJid[0];
+                } else if (ctx?.participant) {
+                    target = ctx.participant;
+                }
+                
+                if (!target) {
+                    const match = textOriginal.match(/(\d{10,15})/);
+                    if (match) {
+                        const num = match[1];
+                        const groupMetadata = await sock.groupMetadata(from);
+                        const member = groupMetadata.participants.find(p => p.id.includes(num));
+                        if (member) target = member.id;
+                    }
+                }
+                
+                if (!target) {
+                    await sock.sendMessage(from, { 
+                        text: `${EMOJIS.error} Usage : !msg @user\n\n${DESIGN.footer()}` 
+                    });
+                    return;
+                }
+                
+                const userName = target.split('@')[0];
+                const messageCount = getUserMessageCount(from, target);
+                const mentionCount = getUserMentionCount(from, target);
+                
+                const statsMsg = DESIGN.header('STATISTIQUES MEMBRE') + `
+
+${EMOJIS.user} *Membre :* @${userName}
+
+${DESIGN.divider}
+
+📨 Messages : ${messageCount}
+🏷️ Mentions : ${mentionCount}
+
+${DESIGN.footer()}`;
+                
+                await sock.sendMessage(from, { text: statsMsg, mentions: [target] });
+            }
+
+            if (isGroup && text === '!top') {
+                logCommand('top', sender, from);
+                const groupMetadata = await sock.groupMetadata(from);
+                const result = await generateTopMembers(from, groupMetadata, 10);
+                
+                if (!result) {
+                    await sock.sendMessage(from, { 
+                        text: `${EMOJIS.info} Aucune activité (24h)\n\n${DESIGN.footer()}` 
+                    });
+                    return;
+                }
+                
+                await sock.sendMessage(from, { text: result.text, mentions: result.mentions });
+            }
+
+            if (isGroup && text === '!seeall') {
+                logCommand('seeall', sender, from);
+                
+                await sock.sendMessage(from, { 
+                    text: `${EMOJIS.chart} *ANALYSE EN COURS...*\n\n⏱️ Quelques secondes...` 
+                });
+                
+                const groupMetadata = await sock.groupMetadata(from);
+                const result = await generateFullReport(from, groupMetadata);
+                
+                if (!result) {
+                    await sock.sendMessage(from, { 
+                        text: `${EMOJIS.info} Aucune activité (24h)\n\n${DESIGN.footer()}` 
+                    });
+                    return;
+                }
+                
+                const maxLength = 4000;
+                if (result.report.length > maxLength) {
+                    const parts = [];
+                    let currentPart = '';
+                    const lines = result.report.split('\n');
+                    
+                    for (const line of lines) {
+                        if ((currentPart + line + '\n').length > maxLength) {
+                            parts.push(currentPart);
+                            currentPart = line + '\n';
+                        } else {
+                            currentPart += line + '\n';
+                        }
+                    }
+                    if (currentPart) parts.push(currentPart);
+                    
+                    for (let i = 0; i < parts.length; i++) {
+                        await sock.sendMessage(from, { 
+                            text: parts[i], 
+                            mentions: i === 0 ? result.mentions : [] 
+                        });
+                        if (i < parts.length - 1) await delay(2000);
+                    }
+                } else {
+                    await sock.sendMessage(from, { text: result.report, mentions: result.mentions });
+                }
+            }
+
+            // COMMANDES ADMIN COMPLÈTES
+
+            if (isGroup && (text === '!add' || text.startsWith('!add '))) {
+                const groupMetadata = await sock.groupMetadata(from);
+                const senderInfo = groupMetadata.participants.find(p => p.id === sender);
+                
+                if (!senderInfo?.admin) {
+                    await sock.sendMessage(from, { text: `${EMOJIS.error} Réservé aux admins` });
+                    return;
+                }
+                
+                logCommand('add', sender, from);
+                const match = textOriginal.match(PATTERNS.phone);
+                
+                if (!match) {
+                    await sock.sendMessage(from, { text: `${EMOJIS.error} Usage: !add +224XXXXXXXXX` });
+                    return;
+                }
+                
+                const num = match[1].replace('+', '');
+                const jid = num + '@s.whatsapp.net';
+                const result = await sock.groupParticipantsUpdate(from, [jid], "add");
+                const status = result[0]?.status;
+                
+                if (status === "200" || status === 200) {
+                    await sock.sendMessage(from, { text: `${EMOJIS.success} +${num} ajouté !\n${DESIGN.footer()}` });
+                } else if (status === "403") {
+                    await sock.sendMessage(from, { 
+                        text: `${EMOJIS.warning} Impossible d'ajouter +${num}\n\n${EMOJIS.shield} Utilise !invite\n\n${DESIGN.footer()}` 
+                    });
+                } else if (status === "408") {
+                    await sock.sendMessage(from, { 
+                        text: `${EMOJIS.clock} +${num} récemment exclu\n\n${EMOJIS.info} Attends 24-48h ou utilise !invite\n\n${DESIGN.footer()}` 
+                    });
+                } else if (status === "409") {
+                    await sock.sendMessage(from, { text: `${EMOJIS.info} +${num} déjà membre\n${DESIGN.footer()}` });
+                } else {
+                    await sock.sendMessage(from, { 
+                        text: `${EMOJIS.error} Erreur (Code: ${status})\n${EMOJIS.shield} Essaye !invite\n\n${DESIGN.footer()}` 
+                    });
+                }
+            }
+
+            if (isGroup && text === '!invite') {
+                const groupMetadata = await sock.groupMetadata(from);
+                const senderInfo = groupMetadata.participants.find(p => p.id === sender);
+                
+                if (!senderInfo?.admin) {
+                    await sock.sendMessage(from, { text: `${EMOJIS.error} Réservé aux admins` });
+                    return;
+                }
+                
+                logCommand('invite', sender, from);
+                
+                try {
+                    const inviteCode = await sock.groupInviteCode(from);
+                    const inviteLink = `https://chat.whatsapp.com/${inviteCode}`;
+                    
+                    await sock.sendMessage(from, { 
+                        text: DESIGN.box(`
+┃ 🔗 *LIEN D'INVITATION*
+┃
+┃ ${EMOJIS.group} ${groupMetadata.subject}
+┃
+┃ ${inviteLink}
+┃
+┃ ${EMOJIS.bell} Partage ce lien pour inviter
+`) + DESIGN.footer()
+                    });
+                } catch (err) {
+                    await sock.sendMessage(from, { 
+                        text: `${EMOJIS.error} Impossible de générer le lien\n\n${DESIGN.footer()}` 
+                    });
+                }
+            }
+
+            if (isGroup && text === '!resetinvite') {
+                const groupMetadata = await sock.groupMetadata(from);
+                const senderInfo = groupMetadata.participants.find(p => p.id === sender);
+                
+                if (!senderInfo?.admin) {
+                    await sock.sendMessage(from, { text: `${EMOJIS.error} Réservé aux admins` });
+                    return;
+                }
+                
+                logCommand('resetinvite', sender, from);
+                
+                try {
+                    await sock.groupRevokeInvite(from);
+                    const newCode = await sock.groupInviteCode(from);
+                    const newLink = `https://chat.whatsapp.com/${newCode}`;
+                    
+                    await sock.sendMessage(from, { 
+                        text: DESIGN.box(`
+┃ ${EMOJIS.success} *LIEN RÉINITIALISÉ*
+┃
+┃ ${EMOJIS.shield} Ancien lien invalide
+┃
+┃ Nouveau : ${newLink}
+`) + DESIGN.footer()
+                    });
+                } catch (err) {
+                    await sock.sendMessage(from, { 
+                        text: `${EMOJIS.error} Échec réinitialisation\n\n${DESIGN.footer()}` 
+                    });
+                }
+            }
+
+            if (isGroup && (text === '!promote' || text.startsWith('!promote '))) {
+                const groupMetadata = await sock.groupMetadata(from);
+                const senderInfo = groupMetadata.participants.find(p => p.id === sender);
+                
+                if (!senderInfo?.admin) {
+                    await sock.sendMessage(from, { text: `${EMOJIS.error} Réservé aux admins` });
+                    return;
+                }
+                
+                logCommand('promote', sender, from);
+                let target = null;
+                const ctx = msg.message.extendedTextMessage?.contextInfo;
+                
+                if (ctx?.mentionedJid?.length) target = ctx.mentionedJid[0];
+                else if (ctx?.participant) target = ctx.participant;
+                
+                if (!target) {
+                    const match = textOriginal.match(/(\d{10,15})/);
+                    if (match) {
+                        const num = match[1];
+                        const member = groupMetadata.participants.find(p => p.id.includes(num));
+                        if (member) target = member.id;
+                    }
+                }
+                
+                if (!target) {
+                    await sock.sendMessage(from, { text: `${EMOJIS.error} Mentionne un membre\nEx: !promote @user` });
+                    return;
+                }
+                
+                const info = groupMetadata.participants.find(p => p.id === target);
+                
+                if (info?.admin) {
+                    await sock.sendMessage(from, { text: `${EMOJIS.warning} Déjà admin` });
+                    return;
+                }
+                
+                await sock.groupParticipantsUpdate(from, [target], "promote");
+                const name = target.split('@')[0];
+                await sock.sendMessage(from, { 
+                    text: DESIGN.box(`
+┃ ${EMOJIS.crown} *PROMOTION*
+┃
+┃ @${name} est maintenant admin !
+`) + DESIGN.footer(), 
+                    mentions: [target] 
+                });
+            }
+
+            if (isGroup && (text === '!demote' || text.startsWith('!demote '))) {
+                const groupMetadata = await sock.groupMetadata(from);
+                const senderInfo = groupMetadata.participants.find(p => p.id === sender);
+                
+                if (!senderInfo?.admin) {
+                    await sock.sendMessage(from, { text: `${EMOJIS.error} Réservé aux admins` });
+                    return;
+                }
+                
+                logCommand('demote', sender, from);
+                let target = null;
+                const ctx = msg.message.extendedTextMessage?.contextInfo;
+                
+                if (ctx?.mentionedJid?.length) target = ctx.mentionedJid[0];
+                else if (ctx?.participant) target = ctx.participant;
+                
+                if (!target) {
+                    const match = textOriginal.match(/(\d{10,15})/);
+                    if (match) {
+                        const num = match[1];
+                        const member = groupMetadata.participants.find(p => p.id.includes(num));
+                        if (member) target = member.id;
+                    }
+                }
+                
+                if (!target) {
+                    await sock.sendMessage(from, { text: `${EMOJIS.error} Mentionne un membre\nEx: !demote @user` });
+                    return;
+                }
+                
+                const info = groupMetadata.participants.find(p => p.id === target);
+                
+                if (!info?.admin) {
+                    await sock.sendMessage(from, { text: `${EMOJIS.warning} Pas admin` });
+                    return;
+                }
+                
+                await sock.groupParticipantsUpdate(from, [target], "demote");
+                const name = target.split('@')[0];
+                await sock.sendMessage(from, { 
+                    text: DESIGN.box(`
+┃ 📉 *RÉTROGRADATION*
+┃
+┃ @${name} n'est plus admin
+`) + DESIGN.footer(), 
+                    mentions: [target] 
+                });
+            }
+
+            if (isGroup && (text === '!kick' || text.startsWith('!kick '))) {
+                const groupMetadata = await sock.groupMetadata(from);
+                const senderInfo = groupMetadata.participants.find(p => p.id === sender);
+                
+                if (!senderInfo?.admin) {
+                    await sock.sendMessage(from, { text: `${EMOJIS.error} Réservé aux admins` });
+                    return;
+                }
+                
+                logCommand('kick', sender, from);
+                let target = null;
+                const ctx = msg.message.extendedTextMessage?.contextInfo;
+                
+                if (ctx?.mentionedJid?.length) target = ctx.mentionedJid[0];
+                else if (ctx?.participant) target = ctx.participant;
+                
+                if (!target) {
+                    const match = textOriginal.match(PATTERNS.phone);
+                    if (match) {
+                        let num = match[1].replace('+', '');
+                        const member = groupMetadata.participants.find(p => p.id.includes(num));
+                        target = member ? member.id : num + '@s.whatsapp.net';
+                    }
+                }
+                
+                if (!target) {
+                    await sock.sendMessage(from, { text: `${EMOJIS.error} Mentionne un membre\nEx: !kick 224...` });
+                    return;
+                }
+                
+                const info = groupMetadata.participants.find(p => p.id === target);
+                
+                if (info?.admin) {
+                    await sock.sendMessage(from, { text: `${EMOJIS.error} Impossible d'exclure un admin` });
+                    return;
+                }
+                
+                await sock.groupParticipantsUpdate(from, [target], "remove");
+                await updateGroupStats(from, 'kicks');
+                const name = target.split('@')[0];
+                
+                await sock.sendMessage(from, { 
+                    text: DESIGN.box(`
+┃ ${EMOJIS.shield} *EXCLUSION*
+┃
+┃ @${name} a été exclu
+`) + DESIGN.footer(), 
+                    mentions: [target] 
+                });
+                
+                warnings.delete(target);
+                userMessages.delete(target);
+            }
+
+            if (isGroup && text === '!warn') {
+                const groupMetadata = await sock.groupMetadata(from);
+                const senderInfo = groupMetadata.participants.find(p => p.id === sender);
+                
+                if (!senderInfo?.admin) {
+                    await sock.sendMessage(from, { text: `${EMOJIS.error} Réservé aux admins` });
+                    return;
+                }
+                
+                logCommand('warn', sender, from);
+                
+                if (warnings.size === 0) {
+                    await sock.sendMessage(from, { text: `${EMOJIS.success} Aucun avertissement\n\n${DESIGN.footer()}` });
+                    return;
+                }
+                
+                let list = DESIGN.header('AVERTISSEMENTS') + "\n\n", i = 0;
+                const mentionsList = [];
+                
+                for (let [id, count] of warnings) {
+                    i++;
+                    const name = id.split('@')[0];
+                    list += `${i}. @${name}\n${DESIGN.progress(count, CONFIG.spam.maxWarnings)} (${count}/${CONFIG.spam.maxWarnings})\n\n`;
+                    mentionsList.push(id);
+                }
+                
+                list += `${DESIGN.footer()}`;
+                await sock.sendMessage(from, { text: list, mentions: mentionsList });
+            }
+
+            if (isGroup && text === '!clearwarns') {
+                const groupMetadata = await sock.groupMetadata(from);
+                const senderInfo = groupMetadata.participants.find(p => p.id === sender);
+                
+                if (!senderInfo?.admin) {
+                    await sock.sendMessage(from, { text: `${EMOJIS.error} Réservé aux admins` });
+                    return;
+                }
+                
+                logCommand('clearwarns', sender, from);
+                const count = warnings.size;
+                warnings.clear();
+                
+                await sock.sendMessage(from, { 
+                    text: `${EMOJIS.success} *${count} AVERTISSEMENT(S) EFFACÉ(S)*\n\n${DESIGN.footer()}` 
+                });
+            }
+
+            if (isGroup && text === '!info') {
+                logCommand('info', sender, from);
+                const groupMetadata = await sock.groupMetadata(from);
+                const participants = groupMetadata.participants;
+                
+                const admins = participants.filter(p => p.admin).length;
+                const members = participants.length - admins;
+                const creation = new Date(groupMetadata.creation * 1000).toLocaleDateString('fr-FR');
+                
+                const info = DESIGN.header('INFO GROUPE') + `
+
+${EMOJIS.group} *Nom :* ${groupMetadata.subject}
+
+${DESIGN.divider}
+
+${EMOJIS.crown} Admins : ${admins}
+${EMOJIS.user} Membres : ${members}
+${EMOJIS.group} Total : ${participants.length}
+
+${DESIGN.divider}
+
+📅 *Créé le :* ${creation}
+
+${DESIGN.footer()}`;
+                
+                await sock.sendMessage(from, { text: info });
+            }
+
+            if (isGroup && text === '!mute') {
+                const groupMetadata = await sock.groupMetadata(from);
+                const senderInfo = groupMetadata.participants.find(p => p.id === sender);
+                
+                if (!senderInfo?.admin) {
+                    await sock.sendMessage(from, { text: `${EMOJIS.error} Réservé aux admins` });
+                    return;
+                }
+                
+                logCommand('mute', sender, from);
+                await sock.groupSettingUpdate(from, 'announcement');
+                
+                await sock.sendMessage(from, { 
+                    text: DESIGN.box(`
+┃ 🔇 *GROUPE MUET*
+┃
+┃ Seuls les admins peuvent parler
+`) + DESIGN.footer()
+                });
+            }
+
+            if (isGroup && text === '!unmute') {
+                const groupMetadata = await sock.groupMetadata(from);
+                const senderInfo = groupMetadata.participants.find(p => p.id === sender);
+                
+                if (!senderInfo?.admin) {
+                    await sock.sendMessage(from, { text: `${EMOJIS.error} Réservé aux admins` });
+                    return;
+                }
+                
+                logCommand('unmute', sender, from);
+                await sock.groupSettingUpdate(from, 'not_announcement');
+                
+                await sock.sendMessage(from, { 
+                    text: DESIGN.box(`
+┃ 🔊 *GROUPE ACTIF*
+┃
+┃ Tout le monde peut parler
+`) + DESIGN.footer()
+                });
+            }
+
+            if (isGroup && (text === '!statuslimit' || text.startsWith('!statuslimit '))) {
+                const groupMetadata = await sock.groupMetadata(from);
+                const senderInfo = groupMetadata.participants.find(p => p.id === sender);
+                
+                if (!senderInfo?.admin) {
+                    await sock.sendMessage(from, { text: `${EMOJIS.error} Réservé aux admins` });
+                    return;
+                }
+                
+                logCommand('statuslimit', sender, from);
+                
+                const args = textOriginal.toLowerCase().split(' ');
+                const action = args[1];
+                
+                if (!action || (action !== 'on' && action !== 'off')) {
+                    const currentStatus = isStatusMentionLimitEnabled(from) ? 'ACTIVÉE ✅' : 'DÉSACTIVÉE ❌';
+                    await sock.sendMessage(from, { 
+                        text: DESIGN.box(`
+┃ 📱 *LIMITE MENTIONS STATUT*
+┃
+┃ État : ${currentStatus}
+┃ Limite : ${CONFIG.statusMention.maxPerDay}/jour
+┃
+┃ Usage :
+┃ • !statuslimit on
+┃ • !statuslimit off
+`) + DESIGN.footer()
+                    });
+                    return;
+                }
+                
+                if (action === 'on') {
+                    setStatusMentionLimit(from, true);
+                    await sock.sendMessage(from, { 
+                        text: DESIGN.box(`
+┃ ${EMOJIS.success} *LIMITE ACTIVÉE*
+┃
+┃ Max : ${CONFIG.statusMention.maxPerDay} mentions/jour
+`) + DESIGN.footer()
+                    });
+                } else {
+                    setStatusMentionLimit(from, false);
+                    await sock.sendMessage(from, { 
+                        text: DESIGN.box(`
+┃ ${EMOJIS.info} *LIMITE DÉSACTIVÉE*
+`) + DESIGN.footer()
+                    });
+                }
+            }
+
             // COMMANDE !help avec V3.2
             if (isGroup && text === '!help') {
                 logCommand('help', sender, from);
